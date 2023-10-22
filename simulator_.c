@@ -136,8 +136,6 @@ int main(int argc, char* argv[]) {
     while (opcode(state.MEMWB.instr) != HALT) {
         printState(&state);
 
-        newState = state;
-
         newState.cycles += 1;
 
         /* ---------------------- IF stage --------------------- */
@@ -186,7 +184,7 @@ int main(int argc, char* argv[]) {
             newState.EXMEM.aluResult = alu1In + alu2In;
         else
             newState.EXMEM.aluResult = ~(alu2In | alu1In);
-        newState.EXMEM.valB = getRegValue(&state, field1(state.IDEX.instr), state.IDEX.valB);
+        newState.EXMEM.valB = state.IDEX.valB;
         newState.EXMEM.instr = state.IDEX.instr;
         // printf("========================= ALU: %d %d %d\n", alu1In, alu2In, alu1In == alu2In);
 
@@ -200,7 +198,6 @@ int main(int argc, char* argv[]) {
          */
         int opMem = opcode(state.EXMEM.instr);
         if (opMem == SW) {
-            // newState.MEMWB.writeData = state.EXMEM.valB;
             newState.dataMem[state.EXMEM.aluResult] = state.EXMEM.valB;
         } else if (opMem == LW) {
             newState.MEMWB.writeData = state.dataMem[state.EXMEM.aluResult];
@@ -219,11 +216,7 @@ int main(int argc, char* argv[]) {
         int opWb = opcode(state.MEMWB.instr);
         if (opWb == LW) {
             newState.reg[field1(state.MEMWB.instr)] = state.MEMWB.writeData;
-        }
-        // else if (opWb == SW) {
-        //     newState.dataMem[state.reg[field0(state.MEMWB.instr)] + field2(state.MEMWB.instr)] = state.MEMWB.writeData;
-        // }
-        else if (opWb <= NOR) {
+        } else if (opWb <= NOR) {
             newState.reg[field2(state.MEMWB.instr)] = state.MEMWB.writeData;
         }
         newState.WBEND.writeData = state.MEMWB.writeData;
@@ -423,7 +416,6 @@ int getRegValue(stateType* state, int reg, int now) {
         field1(state->WBEND.instr) == reg) {
         return state->WBEND.writeData;
     }
-
     return now;
 }
 
@@ -435,7 +427,6 @@ int isRegUsed(int instr, int reg) {
         case NOR:
         case BEQ:
         case SW:
-            // case LW:
             return field0(instr) == reg || field1(instr) == reg;
         case LW:
             return field0(instr) == reg;

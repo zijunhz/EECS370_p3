@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+// #define DEBUG_MODE
+
 // Machine Definitions
 #define NUMMEMORY 65536  // maximum number of data words in memory
 #define NUMREGS 8        // number of machine registers
@@ -34,6 +36,18 @@ const char* opcode_to_str_map[] = {
 
 #define NOOPINSTR (NOOP << 22)
 
+#define HAZ_1_REG_A 0b00000001
+#define HAZ_1_REG_B 0b00000010
+#define HAZ_2_REG_A 0b00000100
+#define HAZ_2_REG_B 0b00001000
+#define HAZ_3_REG_A 0b00010000
+#define HAZ_3_REG_B 0b00100000
+
+typedef struct DetectorStruct {
+    int reg[3];
+    int isLW;
+} DetectorType;
+
 typedef struct IFIDStruct {
     int pcPlus1;
     int instr;
@@ -45,6 +59,7 @@ typedef struct IDEXStruct {
     int valB;
     int offset;
     int instr;
+    int hazard;
 } IDEXType;
 
 typedef struct EXMEMStruct {
@@ -77,6 +92,7 @@ typedef struct stateStruct {
     MEMWBType MEMWB;
     WBENDType WBEND;
     unsigned int cycles;  // number of cycles run so far
+    DetectorType detector;
 } stateType;
 
 static inline int opcode(int instruction) {
@@ -103,8 +119,29 @@ static inline int convertNum(int num) {
 void printState(stateType*);
 void printInstruction(int);
 void readMachineCode(stateType*, char*);
-int getRegValue(stateType*, int, int);
-int isRegUsed(int, int);
+void stageIF(IFIDType* pIFID,
+             int* pPc_new,
+             const int* pPc_old,
+             const int instrMem[],
+             const int* pBranchTarget);
+void stageID(IDEXType* pIDEX,
+             DetectorType* pDetector_new,
+             const IFIDType* pIFID,
+             const int reg[],
+             const DetectorType* pDetector_old,
+             int* pStall);
+void stageEX(EXMEMType* pEXMEM,
+             const IDEXType* pIDEX,
+             const int* pData1,
+             const int* pData2,
+             const int* pData3);
+void stageMEM(MEMWBType* pMEMWB,
+              int dataMem_new[],
+              const EXMEMType* pEXMEM,
+              const int dataMem_old[]);
+void stageWB(WBENDType* pWBEND,
+             int reg[],
+             const MEMWBType* pMEMWB);
 
 int main(int argc, char* argv[]) {
     /* Declare state and newState.
@@ -112,6 +149,7 @@ int main(int argc, char* argv[]) {
        dataMem are not allocated on the stack. */
 
     static stateType state, newState;
+    static int stall = 0;
 
     if (argc != 2) {
         printf("error: usage: %s <machine-code file>\n", argv[0]);
@@ -121,113 +159,64 @@ int main(int argc, char* argv[]) {
     readMachineCode(&state, argv[1]);
 
     // Initialize state here
-
-    state.cycles = 0;
-    memset(state.reg, 0, sizeof(state.reg));
-    state.pc = 0;
-    state.IFID.instr = NOOPINSTR;
-    state.IDEX.instr = NOOPINSTR;
-    state.EXMEM.instr = NOOPINSTR;
-    state.MEMWB.instr = NOOPINSTR;
-    state.WBEND.instr = NOOPINSTR;
+    state.IFID.instr = 7 << 22;
+    state.IDEX.instr = 7 << 22;
+    state.EXMEM.instr = 7 << 22;
+    state.MEMWB.instr = 7 << 22;
+    state.WBEND.instr = 7 << 22;
+    state.detector.reg[0] = -1;
+    state.detector.reg[1] = -1;
+    state.detector.reg[2] = -1;
 
     newState = state;
 
     while (opcode(state.MEMWB.instr) != HALT) {
         printState(&state);
 
-        newState = state;
-
         newState.cycles += 1;
 
-        /* ---------------------- IF stage --------------------- */
-
-        newState.IFID.instr = state.instrMem[state.pc];
-        newState.IFID.pcPlus1 = state.pc + 1;
-
-        newState.pc = state.pc + 1;
-
-        /* ---------------------- ID stage --------------------- */
-        // You will need to stall for one type of data hazard: a lw followed by an instruction that uses the register being loaded.
-
-        if (opcode(state.IDEX.instr) == LW && isRegUsed(state.IFID.instr, field1(state.IDEX.instr))) {
-            newState.IDEX.instr = NOOPINSTR;
-            newState.pc = state.pc;
-            newState.IFID = state.IFID;
+        if (state.EXMEM.eq) {
+            newState.EXMEM.instr = 7 << 22;
+            newState.IDEX.instr = 7 << 22;
+            newState.IFID.instr = 7 << 22;
+            newState.pc = state.EXMEM.branchTarget;
+            newState.EXMEM.eq = 0;
         } else {
-            newState.IDEX.instr = state.IFID.instr;
-            newState.IDEX.valA = state.reg[field0(state.IFID.instr)];
-            newState.IDEX.valB = state.reg[field1(state.IFID.instr)];
-            newState.IDEX.pcPlus1 = state.IFID.pcPlus1;
-            newState.IDEX.offset = convertNum(field2(state.IFID.instr));
+            /* ---------------------- ID stage --------------------- */
+            stageID(&newState.IDEX,
+                    &newState.detector,
+                    &state.IFID,
+                    state.reg,
+                    &state.detector,
+                    &stall);
+
+            /* ---------------------- IF stage --------------------- */
+            if (!stall)
+                stageIF(&newState.IFID,
+                        &newState.pc,
+                        &state.pc,
+                        state.instrMem,
+                        &state.EXMEM.branchTarget);
+            stall = 0;
+
+            /* ---------------------- EX stage --------------------- */
+            stageEX(&newState.EXMEM,
+                    &state.IDEX,
+                    &state.EXMEM.aluResult,
+                    &state.MEMWB.writeData,
+                    &state.WBEND.writeData);
         }
-
-        /* ---------------------- EX stage --------------------- */
-        /*
-        Use data forwarding to resolve most data hazards.
-        The ALU should be able to take its inputs from any pipeline register
-        (instead of just the IDEX register).
-        To account for a lack of internal forwarding within the register file,
-        you’ll instead forward data from the new WBEND pipeline register.
-        Remember to take the most recent data
-        (e.g., data in the EXMEM register gets priority over data in the MEMWB register).
-        ONLY FORWARD DATA TO THE EX STAGE (not to memory).
-        */
-
-        newState.EXMEM.branchTarget = state.IDEX.pcPlus1 + state.IDEX.offset;
-        int alu1In = getRegValue(&state, field0(state.IDEX.instr), state.IDEX.valA), alu2In = 0;
-        if (opcode(state.IDEX.instr) <= NOR || opcode(state.IDEX.instr) == BEQ)
-            alu2In = getRegValue(&state, field1(state.IDEX.instr), state.IDEX.valB);
-        else
-            alu2In = state.IDEX.offset;
-        newState.EXMEM.eq = (alu2In == alu1In);
-        int aluOp = opcode(state.IDEX.instr) == NOR;
-        if (aluOp == 0)
-            newState.EXMEM.aluResult = alu1In + alu2In;
-        else
-            newState.EXMEM.aluResult = ~(alu2In | alu1In);
-        newState.EXMEM.valB = getRegValue(&state, field1(state.IDEX.instr), state.IDEX.valB);
-        newState.EXMEM.instr = state.IDEX.instr;
-        // printf("========================= ALU: %d %d %d\n", alu1In, alu2In, alu1In == alu2In);
 
         /* --------------------- MEM stage --------------------- */
-        /*Predict branch-not-taken to speculate on branches,
-        and decide whether or not to take the branch in the MEM stage.
-        This requires you to discard instructions if it turns out
-        that the branch prediction was incorrect.
-        To discard instructions, change the relevant instructions
-        in the pipeline to the noop instruction (0x1c00000).
-         */
-        int opMem = opcode(state.EXMEM.instr);
-        if (opMem == SW) {
-            // newState.MEMWB.writeData = state.EXMEM.valB;
-            newState.dataMem[state.EXMEM.aluResult] = state.EXMEM.valB;
-        } else if (opMem == LW) {
-            newState.MEMWB.writeData = state.dataMem[state.EXMEM.aluResult];
-        } else if (opMem <= NOR) {
-            newState.MEMWB.writeData = state.EXMEM.aluResult;
-        }
-        if (opMem == BEQ && state.EXMEM.eq) {
-            newState.pc = state.EXMEM.branchTarget;
-            newState.IFID.instr = NOOPINSTR;
-            newState.IDEX.instr = NOOPINSTR;
-            newState.EXMEM.instr = NOOPINSTR;
-        }
-        newState.MEMWB.instr = state.EXMEM.instr;
+        stageMEM(&newState.MEMWB,
+                 newState.dataMem,
+                 &state.EXMEM,
+                 state.dataMem);
+
         /* ---------------------- WB stage --------------------- */
-        // the starter code stops when the halt instruction reaches the MEMWB register.
-        int opWb = opcode(state.MEMWB.instr);
-        if (opWb == LW) {
-            newState.reg[field1(state.MEMWB.instr)] = state.MEMWB.writeData;
-        }
-        // else if (opWb == SW) {
-        //     newState.dataMem[state.reg[field0(state.MEMWB.instr)] + field2(state.MEMWB.instr)] = state.MEMWB.writeData;
-        // }
-        else if (opWb <= NOR) {
-            newState.reg[field2(state.MEMWB.instr)] = state.MEMWB.writeData;
-        }
-        newState.WBEND.writeData = state.MEMWB.writeData;
-        newState.WBEND.instr = state.MEMWB.instr;
+        stageWB(&newState.WBEND,
+                newState.reg,
+                &state.MEMWB);
 
         /* ------------------------ END ------------------------ */
         state = newState; /* this is the last statement before end of the loop. It marks the end
@@ -237,6 +226,181 @@ int main(int argc, char* argv[]) {
     printf("Total of %d cycles executed\n", state.cycles);
     printf("Final state of machine:\n");
     printState(&state);
+}
+
+void stageIF(IFIDType* pIFID,
+             int* pPc_new,
+             const int* pPc_old,
+             const int instrMem[],
+             const int* pBranchTarget) {
+    static int instr;
+    static int op;
+    static int addRes;
+    static int muxRes;
+    instr = instrMem[*pPc_old];
+    op = opcode(instr);
+
+    // if (1) // TODO: INSTR MEM EN?
+    pIFID->instr = instr;
+    addRes = *pPc_old + 1;
+    // if (1) // TODO: BEQ?
+    muxRes = addRes;
+    // else
+    //     muxResult = muxResult; // TODO: BEQ?
+    // if (1) // TODO: PC EN?
+    *pPc_new = muxRes;
+    if (op != NOOP)
+        pIFID->pcPlus1 = addRes;
+}
+
+void stageID(IDEXType* pIDEX,
+             DetectorType* pDetector_new,
+             const IFIDType* pIFID,
+             const int reg[],
+             const DetectorType* pDetector_old,
+             int* pStall) {
+    static int instr;
+    static int op;
+    static int regA, regB;
+    instr = pIFID->instr;
+    op = opcode(instr);
+    regA = field0(instr);
+    regB = field1(instr);
+    pIDEX->instr = instr;
+    // if (1) // TODO: REG EN?
+    //     np->reg[0] = np->reg[0]; // TODO
+
+    pIDEX->hazard = 0;
+
+    if (((op < HALT && op >= 0 && regA == pDetector_old->reg[0]) ||
+         (op != LW && op <= BEQ && op >= 0 && regB == pDetector_old->reg[0])) &&
+        pDetector_old->isLW) {
+        pIDEX->instr = 7 << 22;
+        op == NOOP;
+        *pStall = 1;
+    } else {
+        if (op < HALT && op >= 0) {
+            if (regA == pDetector_old->reg[0])
+                pIDEX->hazard |= HAZ_1_REG_A;
+            if (regA == pDetector_old->reg[1])
+                pIDEX->hazard |= HAZ_2_REG_A;
+            if (regA == pDetector_old->reg[2])
+                pIDEX->hazard |= HAZ_3_REG_A;
+        }
+        if (op != LW && op <= BEQ && op >= 0) {
+            if (regB == pDetector_old->reg[0])
+                pIDEX->hazard |= HAZ_1_REG_B;
+            if (regB == pDetector_old->reg[1])
+                pIDEX->hazard |= HAZ_2_REG_B;
+            if (regB == pDetector_old->reg[2])
+                pIDEX->hazard |= HAZ_3_REG_B;
+        }
+
+        if (op != NOOP)
+            pIDEX->pcPlus1 = pIFID->pcPlus1;
+        if (op < HALT && op >= 0)
+            pIDEX->valA = reg[regA];
+        if (op != LW && op <= BEQ && op >= 0)
+            pIDEX->valB = reg[regB];
+        pIDEX->offset = convertNum(field2(instr));
+    }
+
+    pDetector_new->reg[2] = pDetector_old->reg[1];
+    pDetector_new->reg[1] = pDetector_old->reg[0];
+    if (op == ADD || op == NOR) {
+        pDetector_new->reg[0] = field2(instr);
+        pDetector_new->isLW = 0;
+    } else if (op == LW) {
+        pDetector_new->reg[0] = regB;
+        pDetector_new->isLW = 1;
+    } else {
+        pDetector_new->reg[0] = -1;
+        pDetector_new->isLW = 0;
+    }
+}
+
+void stageEX(EXMEMType* pEXMEM,
+             const IDEXType* pIDEX,
+             const int* pData1,
+             const int* pData2,
+             const int* pData3) {
+    static int op;
+    static int valA, valB;
+    static int muxRes;
+    op = opcode(pIDEX->instr);
+    pEXMEM->instr = pIDEX->instr;
+
+    if (pIDEX->hazard & HAZ_1_REG_A)
+        valA = *pData1;
+    else if (pIDEX->hazard & HAZ_2_REG_A)
+        valA = *pData2;
+    else if (pIDEX->hazard & HAZ_3_REG_A)
+        valA = *pData3;
+    else
+        valA = pIDEX->valA;
+
+    if (pIDEX->hazard & HAZ_1_REG_B)
+        valB = *pData1;
+    else if (pIDEX->hazard & HAZ_2_REG_B)
+        valB = *pData2;
+    else if (pIDEX->hazard & HAZ_3_REG_B)
+        valB = *pData3;
+    else
+        valB = pIDEX->valB;
+
+    if (op == SW || op == LW)
+        muxRes = pIDEX->offset;
+    else
+        muxRes = valB;
+
+    pEXMEM->branchTarget = pIDEX->pcPlus1 + pIDEX->offset;
+    if (op == BEQ)
+        pEXMEM->eq = valA == muxRes;
+    else
+        pEXMEM->eq = 0;
+
+    if (op <= SW && op >= 0)
+        if (op == NOR)
+            pEXMEM->aluResult = ~(valA | muxRes);
+        else
+            pEXMEM->aluResult = valA + muxRes;
+
+    if (op == SW)
+        pEXMEM->valB = valB;
+}
+
+void stageMEM(MEMWBType* pMEMWB,
+              int dataMem_new[],
+              const EXMEMType* pEXMEM,
+              const int dataMem_old[]) {
+    static int op;
+    op = opcode(pEXMEM->instr);
+    pMEMWB->instr = pEXMEM->instr;
+    if (op < SW && op >= 0)
+        if (op == LW)
+            pMEMWB->writeData = dataMem_old[pEXMEM->aluResult];
+        else
+            pMEMWB->writeData = pEXMEM->aluResult;
+    if (op == SW)
+        dataMem_new[pEXMEM->aluResult] = pEXMEM->valB;
+}
+
+void stageWB(WBENDType* pWBEND,
+             int reg[],
+             const MEMWBType* pMEMWB) {
+    static int instr;
+    static int op;
+    static int muxResult;
+    instr = pMEMWB->instr;
+    pWBEND->instr = instr;
+    op = opcode(instr);
+    if (op == LW)
+        muxResult = field1(instr);
+    else
+        muxResult = field2(instr);
+    if (op < SW && op >= 0)
+        reg[muxResult] = pMEMWB->writeData;
+    pWBEND->writeData = pMEMWB->writeData;
 }
 
 /*
@@ -296,6 +460,14 @@ void printState(stateType* statePtr) {
     }
     printf("\n");
 
+#ifdef DEBUG_MODE
+    printf("\t[[Detector: %d, %d, %d | LW: %d]]\n",
+           statePtr->detector.reg[0],
+           statePtr->detector.reg[1],
+           statePtr->detector.reg[2],
+           statePtr->detector.isLW);
+#endif
+
     // ID/EX
     int idexOp = opcode(statePtr->IDEX.instr);
     printf("\tID/EX pipeline register:\n");
@@ -322,6 +494,10 @@ void printState(stateType* statePtr) {
         printf(" (Don't Care)");
     }
     printf("\n");
+
+#ifdef DEBUG_MODE
+    printf("\t[[Hazard: 0x%x]]\n", statePtr->IDEX.hazard);
+#endif
 
     // EX/MEM
     int exmemOp = opcode(statePtr->EXMEM.instr);
@@ -351,13 +527,13 @@ void printState(stateType* statePtr) {
     printf("\n");
 
     // MEM/WB
-    int memwbOp = opcode(statePtr->MEMWB.instr);
+    int op = opcode(statePtr->MEMWB.instr);
     printf("\tMEM/WB pipeline register:\n");
     printf("\t\tinstruction = %d ( ", statePtr->MEMWB.instr);
     printInstruction(statePtr->MEMWB.instr);
     printf(" )\n");
     printf("\t\twriteData = %d", statePtr->MEMWB.writeData);
-    if (memwbOp >= SW || memwbOp < 0) {
+    if (op >= SW || op < 0) {
         printf(" (Don't Care)");
     }
     printf("\n");
@@ -400,47 +576,4 @@ void readMachineCode(stateType* state, char* filename) {
         printInstruction(state->dataMem[state->numMemory] = state->instrMem[state->numMemory]);
         printf("\n");
     }
-}
-
-int getRegValue(stateType* state, int reg, int now) {
-    if (opcode(state->EXMEM.instr) <= NOR &&
-        field2(state->EXMEM.instr) == reg) {
-        return state->EXMEM.aluResult;
-    }
-    if (opcode(state->MEMWB.instr) <= NOR &&
-        field2(state->MEMWB.instr) == reg) {
-        return state->MEMWB.writeData;
-    }
-    if (opcode(state->MEMWB.instr) == LW &&
-        field1(state->MEMWB.instr) == reg) {
-        return state->MEMWB.writeData;
-    }
-    if (opcode(state->WBEND.instr) <= NOR &&
-        field2(state->WBEND.instr) == reg) {
-        return state->WBEND.writeData;
-    }
-    if (opcode(state->WBEND.instr) == LW &&
-        field1(state->WBEND.instr) == reg) {
-        return state->WBEND.writeData;
-    }
-
-    return now;
-}
-
-int isRegUsed(int instr, int reg) {
-    int opc = opcode(instr);
-    // printf("===========================%d %d %d\n", field0(instr), field1(instr), reg);
-    switch (opc) {
-        case ADD:
-        case NOR:
-        case BEQ:
-        case SW:
-            // case LW:
-            return field0(instr) == reg || field1(instr) == reg;
-        case LW:
-            return field0(instr) == reg;
-        default:
-            break;
-    }
-    return 0;
 }
